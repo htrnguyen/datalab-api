@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Datalab OCR Demo</title>
+    <style>
+      body {
+        margin: 0;
+        font-family: Arial, sans-serif;
+        background: #f5f6f8;
+        color: #1f2937;
+      }
+      .page {
+        max-width: 1200px;
+        margin: 0 auto;
+        padding: 16px;
+      }
+      .toolbar {
+        display: flex;
+        gap: 12px;
+        align-items: center;
+        flex-wrap: wrap;
+        margin-bottom: 12px;
+      }
+      .layout {
+        display: grid;
+        grid-template-columns: 2fr 1fr;
+        gap: 12px;
+      }
+      .panel {
+        background: #fff;
+        border-radius: 8px;
+        padding: 12px;
+        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+      }
+      .canvas-wrap {
+        position: relative;
+        overflow: auto;
+      }
+      #imageCanvas {
+        width: 100%;
+        border: 1px solid #e5e7eb;
+        border-radius: 6px;
+        background: #fff;
+      }
+      .item {
+        border: 1px solid #e5e7eb;
+        border-radius: 6px;
+        padding: 8px;
+        margin-bottom: 8px;
+      }
+      .item.active {
+        border-color: #2563eb;
+        background: #eff6ff;
+      }
+      .meta {
+        font-size: 12px;
+        color: #6b7280;
+      }
+      button {
+        padding: 8px 12px;
+        border: none;
+        border-radius: 6px;
+        background: #2563eb;
+        color: #fff;
+        cursor: pointer;
+      }
+      button:disabled {
+        opacity: 0.6;
+        cursor: not-allowed;
+      }
+      @media (max-width: 960px) {
+        .layout {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="page">
+      <h2>Datalab OCR Box Viewer</h2>
+      <div class="toolbar panel">
+        <input id="imageInput" type="file" accept="image/*" />
+        <input
+          id="apiUrlInput"
+          type="text"
+          value="http://localhost:8000/api/v1/ocr"
+          style="min-width: 320px; padding: 8px"
+        />
+        <label>
+          <input id="refineInput" type="checkbox" checked />
+          Refine infographic
+        </label>
+        <button id="runBtn">Run OCR</button>
+        <span id="status" class="meta"></span>
+      </div>
+
+      <div class="layout">
+        <div class="panel canvas-wrap">
+          <canvas id="imageCanvas"></canvas>
+        </div>
+        <div class="panel">
+          <h3>Detected Boxes</h3>
+          <div id="list"></div>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      const input = document.getElementById("imageInput");
+      const apiUrlInput = document.getElementById("apiUrlInput");
+      const refineInput = document.getElementById("refineInput");
+      const runBtn = document.getElementById("runBtn");
+      const statusEl = document.getElementById("status");
+      const listEl = document.getElementById("list");
+      const canvas = document.getElementById("imageCanvas");
+      const ctx = canvas.getContext("2d");
+
+      let imageBitmap = null;
+      let flatBoxes = [];
+      let activeIndex = -1;
+
+      function setStatus(text) {
+        statusEl.textContent = text;
+      }
+
+      function normalizeBbox(node) {
+        const box = node.bbox || node.bounding_box || node.box;
+        if (box && typeof box === "object") {
+          const x = Number(box.x ?? box.left ?? 0);
+          const y = Number(box.y ?? box.top ?? 0);
+          const w = Number(box.width ?? box.w ?? 0);
+          const h = Number(box.height ?? box.h ?? 0);
+          if (w > 0 && h > 0) {
+            return { x, y, width: w, height: h };
+          }
+        }
+
+        const poly = node.polygon || node.quad;
+        if (Array.isArray(poly) && poly.length >= 4) {
+          const xs = poly.map((p) => Number(p.x ?? p[0]));
+          const ys = poly.map((p) => Number(p.y ?? p[1]));
+          const minX = Math.min(...xs);
+          const minY = Math.min(...ys);
+          const maxX = Math.max(...xs);
+          const maxY = Math.max(...ys);
+          if (maxX > minX && maxY > minY) {
+            return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+          }
+        }
+        return null;
+      }
+
+      function extractText(node) {
+        if (typeof node.text === "string" && node.text.trim()) {
+          return node.text.trim();
+        }
+        if (typeof node.html === "string" && node.html.trim()) {
+          const temp = document.createElement("div");
+          temp.innerHTML = node.html;
+          return temp.textContent?.trim() || "(html block)";
+        }
+        return "";
+      }
+
+      function flattenNodes(nodes, out = []) {
+        for (const node of nodes || []) {
+          const bbox = normalizeBbox(node);
+          const text = extractText(node);
+          if (bbox && text) {
+            out.push({
+              bbox,
+              text,
+              type: node.block_type || "Unknown",
+            });
+          }
+          if (Array.isArray(node.children) && node.children.length > 0) {
+            flattenNodes(node.children, out);
+          }
+        }
+        return out;
+      }
+
+      function drawCanvas() {
+        if (!imageBitmap) {
+          return;
+        }
+        canvas.width = imageBitmap.width;
+        canvas.height = imageBitmap.height;
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(imageBitmap, 0, 0);
+
+        flatBoxes.forEach((item, idx) => {
+          const { x, y, width, height } = item.bbox;
+          ctx.lineWidth = idx === activeIndex ? 3 : 2;
+          ctx.strokeStyle = idx === activeIndex ? "#ef4444" : "#2563eb";
+          ctx.strokeRect(x, y, width, height);
+        });
+      }
+
+      function renderList() {
+        listEl.innerHTML = "";
+        if (!flatBoxes.length) {
+          listEl.innerHTML = "<div class='meta'>No boxes detected.</div>";
+          return;
+        }
+        flatBoxes.forEach((item, idx) => {
+          const div = document.createElement("div");
+          div.className = "item" + (idx === activeIndex ? " active" : "");
+          div.innerHTML =
+            "<div><strong>" +
+            item.type +
+            "</strong></div>" +
+            "<div class='meta'>#" +
+            (idx + 1) +
+            "</div>" +
+            "<div>" +
+            item.text.replaceAll("<", "&lt;") +
+            "</div>";
+          div.addEventListener("mouseenter", () => {
+            activeIndex = idx;
+            renderList();
+            drawCanvas();
+          });
+          listEl.appendChild(div);
+        });
+      }
+
+      async function runOcr() {
+        const file = input.files?.[0];
+        if (!file) {
+          setStatus("Please choose an image.");
+          return;
+        }
+        runBtn.disabled = true;
+        setStatus("Uploading and processing...");
+        try {
+          imageBitmap = await createImageBitmap(file);
+          const form = new FormData();
+          form.append("files", file);
+          form.append("refine", String(refineInput.checked));
+
+          const apiUrl = apiUrlInput.value.trim();
+          if (!apiUrl) {
+            throw new Error("API URL is required");
+          }
+          const res = await fetch(apiUrl, {
+            method: "POST",
+            body: form,
+          });
+          if (!res.ok) {
+            const err = await res.text();
+            throw new Error(err || "OCR request failed");
+          }
+          const json = await res.json();
+          const first = json?.results?.[0];
+          flatBoxes = flattenNodes(first?.children || []);
+          activeIndex = -1;
+          drawCanvas();
+          renderList();
+          setStatus(
+            "Done. " + String(flatBoxes.length) + " boxes with content found."
+          );
+        } catch (error) {
+          setStatus("Error: " + String(error.message || error));
+        } finally {
+          runBtn.disabled = false;
+        }
+      }
+
+      runBtn.addEventListener("click", runOcr);
+    </script>
+  </body>
+</html>
