@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from copy import deepcopy
 from typing import Annotated
 from typing import Any
@@ -90,7 +91,9 @@ async def ocr_images(
             )
         name = file.filename or "upload.png"
         try:
-            result = process_image_bytes(raw, name, refine=refine)
+            result = await asyncio.to_thread(
+                process_image_bytes, raw, name, refine=refine,
+            )
         except Exception as exc:
             raise HTTPException(
                 status_code=422,
