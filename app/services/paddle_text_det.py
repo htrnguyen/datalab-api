@@ -109,7 +109,7 @@ class PaddleTextDetector:
         filename: str,
     ) -> Dict[str, Any]:
         """Run detection on a single image given as raw bytes."""
-        image = Image.open(BytesIO(raw)).convert("RGB")
+        image = Image.open(BytesIO(raw)).convert("BGR")
         arr = self._np.array(image)
         start = time.perf_counter()
         results = list(self._model.predict(arr, batch_size=1))
