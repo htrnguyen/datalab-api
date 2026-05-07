@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
+
+TRUTHY = {"1", "true", "yes", "on"}
 
 
 def _split_keys(raw: str) -> List[str]:
@@ -14,6 +16,13 @@ def _split_keys(raw: str) -> List[str]:
         if k:
             parts.append(k)
     return parts
+
+
+def _as_bool(raw: str, default: bool) -> bool:
+    val = raw.strip().lower()
+    if not val:
+        return default
+    return val in TRUTHY
 
 
 def load_api_keys() -> List[str]:
@@ -47,4 +56,28 @@ def get_settings() -> Settings:
         bbox_padding_ratio=float(os.getenv("DATALAB_BBOX_PADDING", "0.02")),
         http_timeout_sec=float(os.getenv("DATALAB_HTTP_TIMEOUT", "30")),
         max_retries=int(os.getenv("DATALAB_MAX_RETRIES", "2")),
+    )
+
+
+@dataclass(frozen=True)
+class PaddleTextDetSettings:
+    model_name: str
+    model_dir: Optional[str]
+    device: str
+    eager_load: bool
+
+
+def get_paddle_text_det_settings() -> PaddleTextDetSettings:
+    raw_dir = os.getenv("PADDLE_TEXT_DET_MODEL_DIR", "").strip()
+    return PaddleTextDetSettings(
+        model_name=os.getenv(
+            "PADDLE_TEXT_DET_MODEL_NAME",
+            "PP-OCRv5_server_det",
+        ),
+        model_dir=raw_dir or None,
+        device=os.getenv("PADDLE_TEXT_DET_DEVICE", "gpu:0"),
+        eager_load=_as_bool(
+            os.getenv("PADDLE_TEXT_DET_EAGER_LOAD", "1"),
+            default=True,
+        ),
     )

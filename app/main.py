@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
+from contextlib import asynccontextmanager
+from typing import AsyncIterator
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
@@ -11,6 +14,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 
 from app.api.routes.ocr import router as ocr_router
+from app.api.routes.text_detection import router as text_det_router
+from app.core.config import get_paddle_text_det_settings
+from app.services.paddle_text_det import (
+    PaddleTextDetector,
+    PaddleTextDetectorError,
+)
 
 load_dotenv()
 logging.basicConfig(
@@ -20,9 +29,29 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Warm up heavy ML resources on startup."""
+    settings = get_paddle_text_det_settings()
+    if settings.eager_load:
+        try:
+            await asyncio.to_thread(PaddleTextDetector.warm_up)
+            logger.info(
+                "paddle_text_det warm_up ok name=%s device=%s",
+                settings.model_name,
+                settings.device,
+            )
+        except PaddleTextDetectorError:
+            logger.exception("paddle_text_det warm_up failed")
+            raise
+    yield
+
+
 app = FastAPI(
     title="Datalab OCR Service",
-    version="0.1.0",
+    version="0.2.0",
+    lifespan=lifespan,
 )
 app.add_middleware(
     CORSMiddleware,
@@ -32,6 +61,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(ocr_router)
+app.include_router(text_det_router)
 
 
 @app.middleware("http")
