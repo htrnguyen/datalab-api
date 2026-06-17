@@ -1,4 +1,4 @@
-"""Datalab /convert submit + poll with API key rotation."""
+"""Datalab /convert API client with retry and key rotation."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import logging
 import mimetypes
 import re
 import time
-from typing import Any, Callable, Dict, Optional
+from typing import Any
 
 import httpx
 
@@ -15,102 +15,68 @@ from app.core.config import Settings, get_settings, load_api_keys
 logger = logging.getLogger(__name__)
 
 RETRY_STATUS = {401, 403, 429}
-SAFE_FILENAME_PATTERN = re.compile(r"[^A-Za-z0-9._-]+")
+SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
 class DatalabError(RuntimeError):
-    """All keys failed or conversion failed."""
+    """Conversion failed or all keys exhausted."""
 
 
-class KeyRing:
-    """Rotate keys on rate limit or auth errors."""
-
-    def __init__(self, keys: list[str]) -> None:
-        if not keys:
-            raise ValueError("keys required")
-        self._keys = list(keys)
-        self._idx = 0
-
-    def __len__(self) -> int:
-        return len(self._keys)
-
-    def current(self) -> str:
-        if self._idx >= len(self._keys):
-            raise DatalabError("No API key available.")
-        return self._keys[self._idx]
-
-    def rotate(self) -> None:
-        self._idx += 1
-
-    def exhausted(self) -> bool:
-        return self._idx >= len(self._keys)
-
-    def reset(self) -> None:
-        self._idx = 0
-
-
-class DatalabConvertClient:
-    """POST /convert and poll request_check_url until complete."""
+class DatalabClient:
+    """Submit files to Datalab /convert and poll until complete."""
 
     def __init__(
         self,
-        keys: Optional[list[str]] = None,
-        settings: Optional[Settings] = None,
+        keys: list[str] | None = None,
+        settings: Settings | None = None,
     ) -> None:
-        self._keys = KeyRing(keys or load_api_keys())
+        self._keys = list(keys) if keys else load_api_keys()
+        self._idx = 0
         self._settings = settings or get_settings()
+
+    @property
+    def _current_key(self) -> str:
+        if self._idx >= len(self._keys):
+            raise DatalabError("No API key available")
+        return self._keys[self._idx]
+
+    def _rotate(self) -> None:
+        """Move to next key."""
+        self._idx = (self._idx + 1) % len(self._keys)
 
     def convert(
         self,
         file_bytes: bytes,
         filename: str,
-        mode: str,
-        output_format: str,
-        extras: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Run convert; returns final JSON body (status complete)."""
-        self._keys.reset()
-        last_err: Optional[Exception] = None
-        attempts = max(1, self._settings.max_retries)
-        for attempt in range(1, attempts + 1):
+        mode: str = "accurate",
+        output_format: str = "json",
+        extras: str | None = None,
+        mime: str | None = None,
+    ) -> dict[str, Any]:
+        """Upload file, poll until done, return result JSON."""
+        self._idx = 0
+        max_retries = max(1, self._settings.max_retries)
+        last_err: Exception | None = None
+
+        for attempt in range(1, max_retries + 1):
             try:
-                return self._convert_once(
-                    file_bytes, filename, mode, output_format, extras
-                )
-            except DatalabError:
-                raise
+                return self._convert_once(file_bytes, filename, mode, output_format, extras, mime)
             except httpx.HTTPStatusError as exc:
                 last_err = exc
-                code = exc.response.status_code
-                if code in RETRY_STATUS:
-                    logger.warning(
-                        "convert retriable status=%s attempt=%s/%s",
-                        code,
-                        attempt,
-                        attempts,
-                    )
-                    if len(self._keys) > 1:
-                        self._keys.rotate()
-                        if self._keys.exhausted():
-                            self._keys.reset()
-                    if attempt < attempts:
-                        continue
-                else:
-                    raise
-            except (httpx.TimeoutException, httpx.NetworkError, TimeoutError) as exc:
+                if exc.response.status_code in RETRY_STATUS and attempt < max_retries:
+                    self._rotate()
+                    time.sleep(min(8.0, 2 ** attempt))
+                    continue
+                raise
+            except (httpx.TimeoutException, httpx.NetworkError) as exc:
                 last_err = exc
-                logger.warning(
-                    "convert retry on timeout/network attempt=%s/%s error=%s",
-                    attempt,
-                    attempts,
-                    exc,
-                )
-                if attempt < attempts:
+                if attempt < max_retries:
+                    time.sleep(min(8.0, 2 ** attempt))
                     continue
             except Exception as exc:
-                last_err = exc
                 logger.exception("convert failed")
-                break
+                raise DatalabError(str(exc)) from exc
+
         raise DatalabError(str(last_err) if last_err else "convert failed")
 
     def _convert_once(
@@ -119,113 +85,89 @@ class DatalabConvertClient:
         filename: str,
         mode: str,
         output_format: str,
-        extras: Optional[str],
-    ) -> Dict[str, Any]:
+        extras: str | None,
+        mime: str | None,
+    ) -> dict[str, Any]:
+        """Single convert attempt: upload + poll."""
         url = f"{self._settings.base_url}/convert"
-        headers = {"X-API-Key": self._keys.current()}
-        data = {
-            "mode": mode,
-            "output_format": output_format,
-        }
+        safe_name = self._safe_filename(filename)
+
+        # Determine MIME type
+        if mime:
+            final_mime = mime
+        else:
+            final_mime, _ = mimetypes.guess_type(safe_name)
+            if not final_mime:
+                final_mime = "application/octet-stream"
+
+        # Build request
+        timeout = httpx.Timeout(
+            connect=10.0,
+            write=self._settings.http_timeout_sec,
+            read=self._settings.http_timeout_sec,
+            pool=10.0,
+        )
+
+        data: dict[str, Any] = {"mode": mode, "output_format": output_format}
         if extras:
             data["extras"] = extras
-        timeout = httpx.Timeout(self._settings.http_timeout_sec)
-        safe_name = self._safe_filename(filename)
-        mime, _ = mimetypes.guess_type(safe_name)
-        if not mime:
-            mime = "application/octet-stream"
-        with httpx.Client(timeout=timeout) as client:
-            resp = self._request_with_retry(
-                lambda: client.post(
-                    url,
-                    headers=headers,
-                    data=data,
-                    files={"file": (safe_name, file_bytes, mime)},
-                ),
-                action="submit",
-                method="POST",
-                url=url,
-            )
-            if resp.status_code >= 400:
-                resp.raise_for_status()
-            body = resp.json()
+
+        # Reuse client for connection pooling
+        if not hasattr(self, "_http"):
+            self._http = httpx.Client(timeout=timeout)
+        http = self._http
+
+        resp = http.post(
+            url,
+            headers={"X-API-Key": self._current_key},
+            data=data,
+            files={"file": (safe_name, file_bytes, final_mime)},
+        )
+
+        if resp.status_code >= 400:
+            logger.error("Datalab error %d: %s", resp.status_code, resp.text[:300])
+            resp.raise_for_status()
+
+        body = resp.json()
         if not body.get("success"):
-            raise RuntimeError(f"submit failed: {body}")
-        check_url = body["request_check_url"]
-        return self._poll(check_url)
+            raise DatalabError(f"Datalab submit failed: {body}")
+
+        return self._poll(body["request_check_url"])
+
+    def _poll(self, check_url: str) -> dict[str, Any]:
+        """Poll check_url until conversion is complete."""
+        deadline = time.monotonic() + self._settings.poll_timeout_sec
+        timeout = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0)
+
+        # Reuse client for connection pooling
+        if not hasattr(self, "_http"):
+            self._http = httpx.Client(timeout=timeout)
+        http = self._http
+
+        while time.monotonic() < deadline:
+            resp = http.get(check_url, headers={"X-API-Key": self._current_key})
+            resp.raise_for_status()
+            result = resp.json()
+
+            status = result.get("status")
+            if status == "complete":
+                if not result.get("success", True):
+                    raise DatalabError(f"Conversion failed: {result.get('error', 'unknown')}")
+                return result
+            if status == "failed":
+                raise DatalabError(f"Conversion failed: {result.get('error', 'unknown')}")
+
+            time.sleep(self._settings.poll_interval_sec)
+
+        raise DatalabError("Conversion timed out")
 
     @staticmethod
     def _safe_filename(filename: str) -> str:
-        """Sanitize upload name for multipart providers with strict parsing."""
-        stripped = (filename or "upload").strip()
-        if "." in stripped:
-            ext = stripped.rsplit(".", 1)[1].lower()
-        else:
-            ext = "png"
-        base = stripped.rsplit(".", 1)[0]
-        base = SAFE_FILENAME_PATTERN.sub("_", base).strip("._-")
-        if not base:
-            base = "upload"
+        """Sanitize filename for multipart upload."""
+        base = (filename or "upload").strip()
+        ext = "png"
+        if "." in base:
+            base, ext = base.rsplit(".", 1)
+            ext = ext.lower()
+        base = SAFE_FILENAME_RE.sub("_", base).strip("._-") or "upload"
         return f"{base}.{ext}"
-
-    def _poll(self, check_url: str) -> Dict[str, Any]:
-        deadline = time.monotonic() + self._settings.poll_timeout_sec
-        timeout = httpx.Timeout(self._settings.http_timeout_sec)
-        with httpx.Client(timeout=timeout) as client:
-            while time.monotonic() < deadline:
-                if self._keys.exhausted():
-                    raise DatalabError("API keys exhausted during poll")
-                headers = {"X-API-Key": self._keys.current()}
-                r = self._request_with_retry(
-                    lambda: client.get(check_url, headers=headers),
-                    action="poll",
-                    method="GET",
-                    url=check_url,
-                )
-                r.raise_for_status()
-                result = r.json()
-                status = result.get("status")
-                if status == "complete":
-                    if not result.get("success", True):
-                        err = result.get("error", "unknown")
-                        raise RuntimeError(f"conversion failed: {err}")
-                    return result
-                if status == "failed":
-                    err = result.get("error", "unknown")
-                    raise RuntimeError(f"conversion failed: {err}")
-                time.sleep(self._settings.poll_interval_sec)
-        raise TimeoutError("poll timeout")
-
-    def _request_with_retry(
-        self,
-        request_call: Callable[[], httpx.Response],
-        action: str,
-        method: str,
-        url: str,
-    ) -> httpx.Response:
-        start = time.perf_counter()
-        try:
-            response = request_call()
-            elapsed_ms = (time.perf_counter() - start) * 1000
-            logger.info(
-                "datalab_request action=%s method=%s url=%s status=%s "
-                "duration_ms=%.2f",
-                action,
-                method,
-                url,
-                response.status_code,
-                elapsed_ms,
-            )
-            return response
-        except (httpx.TimeoutException, httpx.NetworkError) as exc:
-            elapsed_ms = (time.perf_counter() - start) * 1000
-            logger.warning(
-                "datalab_request_error action=%s method=%s url=%s "
-                "duration_ms=%.2f error=%s",
-                action,
-                method,
-                url,
-                elapsed_ms,
-                exc,
-            )
-            raise

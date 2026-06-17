@@ -2,24 +2,19 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import time
-from contextlib import asynccontextmanager
-from typing import AsyncIterator
+from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import HTMLResponse, Response
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 
 from app.api.routes.ocr import router as ocr_router
-from app.api.routes.text_detection import router as text_det_router
-from app.core.config import get_paddle_text_det_settings
-from app.services.paddle_text_det import (
-    PaddleTextDetector,
-    PaddleTextDetectorError,
-)
+from app.api.routes.storage import router as storage_router
 
 load_dotenv()
 logging.basicConfig(
@@ -30,28 +25,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Warm up heavy ML resources on startup."""
-    settings = get_paddle_text_det_settings()
-    if settings.eager_load:
-        try:
-            await asyncio.to_thread(PaddleTextDetector.warm_up)
-            logger.info(
-                "paddle_text_det warm_up ok name=%s device=%s",
-                settings.model_name,
-                settings.device,
-            )
-        except PaddleTextDetectorError:
-            logger.exception("paddle_text_det warm_up failed")
-            raise
-    yield
-
+BASE_DIR = Path(__file__).resolve().parent
+templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 app = FastAPI(
-    title="Datalab OCR Service",
-    version="0.2.0",
-    lifespan=lifespan,
+    title="OCR Service",
+    version="1.0.0",
 )
 app.add_middleware(
     CORSMiddleware,
@@ -60,13 +39,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Serve static assets
+app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
+
 app.include_router(ocr_router)
-app.include_router(text_det_router)
+app.include_router(storage_router)
 
 
 @app.middleware("http")
 async def log_request_timing(request: Request, call_next) -> Response:
-    """Log each incoming API request with duration and errors."""
     start = time.perf_counter()
     try:
         response = await call_next(request)
@@ -90,16 +72,11 @@ async def log_request_timing(request: Request, call_next) -> Response:
         raise
 
 
-@app.get("/")
-def root() -> dict[str, str]:
-    """Root endpoint for quick service check."""
-    return {
-        "service": "datalab-ocr",
-        "status": "ok",
-    }
+@app.get("/", response_class=HTMLResponse)
+def root(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request})
 
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    """Service health endpoint."""
     return {"status": "ok"}

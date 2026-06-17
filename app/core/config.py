@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import List, Optional
-
-TRUTHY = {"1", "true", "yes", "on"}
+from typing import List
 
 
 def _split_keys(raw: str) -> List[str]:
@@ -16,13 +14,6 @@ def _split_keys(raw: str) -> List[str]:
         if k:
             parts.append(k)
     return parts
-
-
-def _as_bool(raw: str, default: bool) -> bool:
-    val = raw.strip().lower()
-    if not val:
-        return default
-    return val in TRUTHY
 
 
 def load_api_keys() -> List[str]:
@@ -44,6 +35,7 @@ class Settings:
     bbox_padding_ratio: float
     http_timeout_sec: float
     max_retries: int
+    max_upload_size_mb: float
 
 
 def get_settings() -> Settings:
@@ -51,33 +43,13 @@ def get_settings() -> Settings:
     return Settings(
         base_url=base.rstrip("/"),
         poll_interval_sec=float(os.getenv("DATALAB_POLL_INTERVAL", "2")),
-        poll_timeout_sec=float(os.getenv("DATALAB_POLL_TIMEOUT", "30")),
+        poll_timeout_sec=float(os.getenv("DATALAB_POLL_TIMEOUT", "120")),
         refine_max_depth=int(os.getenv("DATALAB_REFINE_MAX_DEPTH", "6")),
         bbox_padding_ratio=float(os.getenv("DATALAB_BBOX_PADDING", "0.02")),
-        http_timeout_sec=float(os.getenv("DATALAB_HTTP_TIMEOUT", "30")),
+        # 90s is enough for any single image upload at our 1800px cap.
+        # Datalab itself usually accepts the upload in <10s on a good
+        # link; this leaves headroom for the long-tail of slow networks.
+        http_timeout_sec=float(os.getenv("DATALAB_HTTP_TIMEOUT", "90")),
         max_retries=int(os.getenv("DATALAB_MAX_RETRIES", "2")),
-    )
-
-
-@dataclass(frozen=True)
-class PaddleTextDetSettings:
-    model_name: str
-    model_dir: Optional[str]
-    device: str
-    eager_load: bool
-
-
-def get_paddle_text_det_settings() -> PaddleTextDetSettings:
-    raw_dir = os.getenv("PADDLE_TEXT_DET_MODEL_DIR", "").strip()
-    return PaddleTextDetSettings(
-        model_name=os.getenv(
-            "PADDLE_TEXT_DET_MODEL_NAME",
-            "PP-OCRv5_server_det",
-        ),
-        model_dir=raw_dir or None,
-        device=os.getenv("PADDLE_TEXT_DET_DEVICE", "gpu:0"),
-        eager_load=_as_bool(
-            os.getenv("PADDLE_TEXT_DET_EAGER_LOAD", "1"),
-            default=True,
-        ),
+        max_upload_size_mb=float(os.getenv("MAX_UPLOAD_SIZE_MB", "50")),
     )

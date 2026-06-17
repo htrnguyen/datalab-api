@@ -1,141 +1,200 @@
-"""Run accurate convert then optional infographic line refinement."""
+"""Simple OCR pipeline: file -> Datalab -> structured blocks.
+
+Supports images (JPG, PNG, WEBP) and PDFs (all pages).
+Bbox coordinates are returned in original document frame.
+"""
 
 from __future__ import annotations
 
 import logging
+import uuid
 from io import BytesIO
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from PIL import Image
 
 from app.core.config import Settings, get_settings
-from app.services.coord_scale import scale_tree_to_image
-from app.services.datalab_client import DatalabConvertClient
-from app.services.html_clean import clean_html_fragment
-from app.services.tree_refiner import refine_document_tree
+from app.services.datalab_client import DatalabClient
 
 logger = logging.getLogger(__name__)
 
 
-def _load_image(path: Path) -> Image.Image:
-    img = Image.open(path)
-    return img.convert("RGB")
-
-
-def _load_image_bytes(raw: bytes) -> Image.Image:
+def _load_image(raw: bytes) -> Image.Image:
+    """Decode image bytes to RGB PIL Image."""
     img = Image.open(BytesIO(raw))
-    return img.convert("RGB")
+    img.load()
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    return img
 
 
-def _flatten_page_html(page: Dict[str, Any]) -> None:
-    """Replace Page html with concatenated cleaned child fragments."""
-    parts: List[str] = []
-    for ch in page.get("children") or []:
-        h = ch.get("html")
-        if h:
-            c = clean_html_fragment(h)
-            if c:
-                parts.append(c)
-    if parts:
-        page["html"] = "\n".join(parts)
+def _get_pdf_page_sizes(raw: bytes) -> list[dict[str, int]]:
+    """Return page sizes for PDF at 1x resolution."""
+    try:
+        import fitz
+        doc = fitz.open(stream=raw, filetype="pdf")
+        sizes = [{"width": int(doc[i].rect.width), "height": int(doc[i].rect.height)}
+                 for i in range(len(doc))]
+        doc.close()
+        return sizes
+    except Exception as exc:
+        logger.warning("Cannot read PDF sizes: %s", exc)
+        return []
 
 
-def _walk_pages(tree: Dict[str, Any]) -> None:
-    for node in tree.get("children") or []:
-        if node.get("block_type") == "Page":
-            _flatten_page_html(node)
-            _walk_pages(node)
+def _extract_blocks(children: list[dict], page_idx: int = 0) -> list[dict]:
+    """Flatten tree to list of blocks."""
+    from app.services.html_clean import html_to_text
+
+    blocks = []
+    for child in children:
+        blocks.extend(_extract_blocks(child.get("children") or [], page_idx))
+
+        btype = child.get("block_type", "")
+        if btype not in ("Text", "Table", "Figure"):
+            continue
+
+        raw_text = child.get("text") or ""
+        if not raw_text:
+            raw_text = html_to_text(child.get("html") or "")
+
+        blocks.append({
+            "index": len(blocks),
+            "id": child.get("id", f"blk_{uuid.uuid4().hex[:6]}"),
+            "type": btype.lower(),
+            "text": raw_text,
+            "html": child.get("html") or "",
+            "bbox": child.get("bbox") or [],
+            "page": child.get("page_index", page_idx),
+        })
+    return blocks
 
 
-def process_image_file(
-    path: str | Path,
-    client: Optional[DatalabConvertClient] = None,
-    settings: Optional[Settings] = None,
-    refine: bool = True,
-) -> Dict[str, Any]:
-    """Accurate JSON OCR, then infographic refinement and html cleanup."""
-    settings = settings or get_settings()
-    client = client or DatalabConvertClient(settings=settings)
-    p = Path(path)
-    raw = p.read_bytes()
-    image = _load_image(p)
+def _assign_page_info(tree: dict, page_sizes: list[dict]) -> None:
+    """Assign page_index and dimensions to Page nodes in tree."""
+    children = tree.get("children") or []
+    page_nodes = [c for c in children if c.get("block_type") == "Page"]
+    for i, node in enumerate(page_nodes):
+        node["page_index"] = i
+        if i < len(page_sizes):
+            node["width"] = page_sizes[i]["width"]
+            node["height"] = page_sizes[i]["height"]
 
-    logger.info("datalab accurate convert: %s", p.name)
-    base = client.convert(
-        raw,
-        p.name,
-        "accurate",
-        "json",
-        extras=None,
-    )
-    tree = base.get("json")
+
+def _process_image(
+    raw: bytes,
+    filename: str,
+    client: DatalabClient,
+    settings: Settings,
+) -> dict:
+    """OCR a single image."""
+    img = _load_image(raw)
+    w, h = img.size
+    logger.info("[pipeline] PIL image size: %dx%d, raw bytes len: %d", w, h, len(raw))
+
+    # Convert to JPEG for upload (PIL strips EXIF, this defines the coordinate frame)
+    buf = BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    payload = buf.getvalue()
+
+    # Re-check size after re-encoding
+    rechecked = Image.open(BytesIO(payload))
+    rw, rh = rechecked.size
+    logger.info("[pipeline] after JPEG re-encode: %dx%d", rw, rh)
+
+    try:
+        result = client.convert(payload, filename, "accurate", "json", mime="image/jpeg")
+    except RuntimeError as exc:
+        logger.error("Datalab OCR failed for %s: %s", filename, exc)
+        raise
+
+    tree = result.get("json", {})
     if not isinstance(tree, dict):
-        raise ValueError("convert json missing")
-    tree = scale_tree_to_image(tree, image.size)
-    out_tree = (
-        refine_document_tree(
-            tree,
-            image,
-            client=client,
-            settings=settings,
-        )
-        if refine
-        else tree
-    )
-    _walk_pages(out_tree)
+        raise ValueError("Datalab returned invalid JSON")
 
-    meta = base.get("metadata")
+    children = tree.get("children") or []
+
+    # Log raw bboxes from Datalab response
+    for i, child in enumerate(children[:5]):
+        logger.info("[pipeline] child[%d] type=%s bbox=%s", i, child.get("block_type"), child.get("bbox"))
+
+    # Get Datalab's internal page size (may differ from input due to resizing)
+    dl_w, dl_h = rw, rh
+    for node in children:
+        if node.get("block_type") == "Page":
+            bbox = node.get("bbox") or []
+            if len(bbox) == 4:
+                dl_w = int(bbox[2])
+                dl_h = int(bbox[3])
+            node["page_index"] = 0
+            node["width"] = rw
+            node["height"] = rh
+            break
+
+    blocks = _extract_blocks(children)
+    logger.info("Image %s: input=%dx%d, datalab=%dx%d, blocks=%d", filename, rw, rh, dl_w, dl_h, len(blocks))
+
     return {
-        "children": out_tree.get("children", []),
-        "metadata": meta,
+        "document_type": "image",
+        "page_count": 1,
+        "page_sizes": [{"width": rw, "height": rh}],
+        "children": children,
+        "blocks": blocks,
+        "image_size": {"width": dl_w, "height": dl_h},
     }
 
 
-def process_image_files(
-    paths: List[str | Path],
-    **kwargs: Any,
-) -> List[Dict[str, Any]]:
-    """Process many images; each completes before the next starts."""
-    return [process_image_file(p, **kwargs) for p in paths]
+def _process_pdf(
+    raw: bytes,
+    filename: str,
+    client: DatalabClient,
+    settings: Settings,
+) -> dict:
+    """OCR a PDF - send directly to Datalab for best multi-page handling."""
+    page_sizes = _get_pdf_page_sizes(raw)
+
+    try:
+        result = client.convert(raw, filename, "accurate", "json", mime="application/pdf")
+    except RuntimeError as exc:
+        logger.error("Datalab PDF OCR failed for %s: %s", filename, exc)
+        raise
+
+    tree = result.get("json", {})
+    if not isinstance(tree, dict):
+        raise ValueError("Datalab returned invalid JSON")
+
+    _assign_page_info(tree, page_sizes)
+
+    children = tree.get("children") or []
+    blocks = _extract_blocks(children)
+    page_count = len(page_sizes)
+
+    logger.info("PDF %s: %d pages, %d blocks", filename, page_count, len(blocks))
+
+    return {
+        "document_type": "pdf",
+        "page_count": page_count,
+        "page_sizes": page_sizes,
+        "children": children,
+        "blocks": blocks,
+        "image_size": page_sizes[0] if page_sizes else {"width": 0, "height": 0},
+    }
 
 
 def process_image_bytes(
     raw: bytes,
     filename: str,
-    client: Optional[DatalabConvertClient] = None,
-    settings: Optional[Settings] = None,
-    refine: bool = True,
-) -> Dict[str, Any]:
-    """Accurate JSON OCR for an in-memory image."""
+    client: DatalabClient | None = None,
+    settings: Settings | None = None,
+) -> dict:
+    """OCR an image or PDF. Returns structured blocks with bbox in original frame."""
     settings = settings or get_settings()
-    client = client or DatalabConvertClient(settings=settings)
-    image = _load_image_bytes(raw)
+    client = client or DatalabClient(settings=settings)
 
-    logger.info("datalab accurate convert: %s", filename)
-    base = client.convert(
-        raw,
-        filename,
-        "accurate",
-        "json",
-        extras=None,
-    )
-    tree = base.get("json")
-    if not isinstance(tree, dict):
-        raise ValueError("convert json missing")
-    tree = scale_tree_to_image(tree, image.size)
-    out_tree = (
-        refine_document_tree(
-            tree,
-            image,
-            client=client,
-            settings=settings,
-        )
-        if refine
-        else tree
-    )
-    _walk_pages(out_tree)
-    return {
-        "children": out_tree.get("children", []),
-        "metadata": base.get("metadata"),
-    }
+    # Detect PDF by magic bytes
+    is_pdf = raw[:4] == b"%PDF"
+
+    if is_pdf:
+        return _process_pdf(raw, filename, client, settings)
+    else:
+        return _process_image(raw, filename, client, settings)
