@@ -2,8 +2,6 @@
 
 from app.schemas.ocr import (
     BlockContent,
-    CostBreakdown,
-    ImageRef,
     OCRResponse,
     PageResult,
     Polygon,
@@ -11,8 +9,6 @@ from app.schemas.ocr import (
 
 __all__ = [
     "BlockContent",
-    "CostBreakdown",
-    "ImageRef",
     "OCRResponse",
     "PageResult",
     "Polygon",

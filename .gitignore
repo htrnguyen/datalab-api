@@ -28,3 +28,17 @@ storage/images/
 
 # Uploads
 uploads/
+
+# Debug logs
+debug_logs/
+
+# Results
+results/
+
+# IDE
+.cursor/
+.vscode/
+.idea/
+
+# Test files
+test/

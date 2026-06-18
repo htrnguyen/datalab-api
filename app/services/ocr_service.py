@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
+import copy
 import io
+import json
 import logging
+import math
+import time
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
 from PIL import Image
 
+from app.core.config import get_settings
 from app.schemas.ocr import (
     BlockContent,
-    CostBreakdown,
-    ImageRef,
     OCRResponse,
     PageResult,
     Polygon,
@@ -22,50 +26,12 @@ from app.services.html_clean import html_to_text
 
 logger = logging.getLogger(__name__)
 
-STORAGE_DIR = Path("uploads")
-
-
-class ImageStore:
-    """Simple image storage for cropped images."""
-
-    def __init__(self, storage_dir: Path | None = None):
-        self._storage_dir = storage_dir or STORAGE_DIR
-        self._storage_dir.mkdir(exist_ok=True, parents=True)
-
-    def save(self, image_bytes: bytes, prefix: str = "img") -> str:
-        """Save image bytes and return file_id."""
-        import hashlib
-        import uuid
-
-        file_id = f"{prefix}_{hashlib.md5(image_bytes[:1024]).hexdigest()[:8]}_{uuid.uuid4().hex[:6]}"
-        file_path = self._storage_dir / f"{file_id}.png"
-
-        with open(file_path, "wb") as f:
-            f.write(image_bytes)
-
-        return file_id
-
-
-# Global image store
-_image_store: ImageStore | None = None
-
-
-def get_image_store() -> ImageStore:
-    """Get or create image store."""
-    global _image_store
-    if _image_store is None:
-        _image_store = ImageStore()
-    return _image_store
-
 
 class OCRService:
     """Service for OCR processing via Datalab API."""
 
-    def __init__(
-        self, datalab_client: DatalabClient, image_store: ImageStore | None = None
-    ):
+    def __init__(self, datalab_client: DatalabClient):
         self._client = datalab_client
-        self._image_store = image_store or get_image_store()
 
     def process(
         self,
@@ -73,6 +39,7 @@ class OCRService:
         filename: str,
         mode: str = "accurate",
         infographic: bool = False,
+        request_id: str | None = None,
     ) -> OCRResponse:
         """Process file through Datalab API and return unified response.
 
@@ -81,49 +48,146 @@ class OCRService:
             filename: Original filename
             mode: Processing mode (fast, balanced, accurate)
             infographic: Extract table structure with line-by-line breakdown
-
-        Returns:
-            OCRResponse with normalized structure
+            request_id: Optional request ID for tracing
         """
-        extras = "infographic" if infographic else None
+        settings = get_settings()
+        size_bytes = len(file_bytes)
+        size_mb = size_bytes / (1024 * 1024)
 
-        result = self._client.convert(
-            file_bytes=file_bytes,
-            filename=filename,
-            mode=mode,
-            output_format="json",
-            extras=extras,
-            mime=None,
+        logger.info(
+            "ocr_process_start request_id=%s filename=%s size_bytes=%s size_mb=%.3f mode=%s infographic=%s",
+            request_id,
+            filename,
+            size_bytes,
+            size_mb,
+            mode,
+            infographic,
         )
 
-        return self._transform_response(result, file_bytes)
-
-    def _crop_and_save_figure(
-        self,
-        source_bytes: bytes,
-        bbox: list[float],
-        block_id: str,
-    ) -> str | None:
-        """Crop figure from source image based on bbox."""
+        start = time.perf_counter()
         try:
-            image = Image.open(io.BytesIO(source_bytes))
-            img_width, img_height = image.size
-
-            x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
-            x1 = max(0, min(x1, img_width))
-            y1 = max(0, min(y1, img_height))
-            x2 = max(x1 + 1, min(x2, img_width))
-            y2 = max(y1 + 1, min(y2, img_height))
-
-            cropped = image.crop((x1, y1, x2, y2))
-            output = io.BytesIO()
-            cropped.save(output, format="PNG", optimize=True)
-            return self._image_store.save(
-                output.getvalue(), prefix=f"fig_{hash(block_id) % 10000:04d}"
+            result = self._client.convert(
+                file_bytes=file_bytes,
+                filename=filename,
+                mode=mode,
+                output_format="json",
+                extras="infographic" if infographic else None,
+                mime=None,
             )
         except Exception as exc:
-            logger.error(f"Failed to crop figure: {exc}")
-            return None
+            logger.exception(
+                "ocr_datalab_failed request_id=%s filename=%s size_bytes=%s mode=%s infographic=%s",
+                request_id,
+                filename,
+                size_bytes,
+                mode,
+                infographic,
+            )
+            raise
+
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        logger.info(
+            "ocr_datalab_done request_id=%s filename=%s size_bytes=%s mode=%s infographic=%s elapsed_ms=%.2f",
+            request_id,
+            filename,
+            size_bytes,
+            mode,
+            infographic,
+            elapsed_ms,
+        )
+
+        try:
+            response = self._transform_response(result, file_bytes)
+        except Exception as exc:
+            logger.exception(
+                "ocr_transform_failed request_id=%s filename=%s size_bytes=%s mode=%s infographic=%s",
+                request_id,
+                filename,
+                size_bytes,
+                mode,
+                infographic,
+            )
+            raise
+
+        block_type_stats = Counter(
+            block.block_type for page in response.pages for block in page.blocks
+        )
+        orig_width = orig_height = 0
+        if file_bytes:
+            try:
+                orig_width, orig_height = Image.open(io.BytesIO(file_bytes)).size
+            except Exception as exc:
+                logger.debug("ocr_orig_image_size_failed error=%s", exc)
+        page_sizes = [
+            f"{page.width}x{page.height}" for page in response.pages
+        ] or ["0x0"]
+        logger.info(
+            "ocr_transform_done request_id=%s filename=%s size_bytes=%s page_count=%s block_count=%s block_types=%s runtime_seconds=%s cost_cents=%s orig_size=%s page_sizes=%s",
+            request_id,
+            filename,
+            size_bytes,
+            response.page_count,
+            sum(len(page.blocks) for page in response.pages),
+            dict(block_type_stats),
+            response.runtime_seconds,
+            response.cost_cents,
+            f"{orig_width}x{orig_height}",
+            page_sizes,
+        )
+
+        if settings.debug_log_enabled:
+            try:
+                self._save_debug_payload(
+                    request_id=request_id,
+                    filename=filename,
+                    mode=mode,
+                    infographic=infographic,
+                    datalab_result=result,
+                    response=response,
+                )
+            except Exception as exc:  # pragma: no cover - best-effort debug
+                logger.debug("ocr_debug_save_failed request_id=%s: %s", request_id, exc)
+
+        return response
+
+    def _save_debug_payload(
+        self,
+        request_id: str | None,
+        filename: str,
+        mode: str,
+        infographic: bool,
+        datalab_result: dict[str, Any],
+        response: OCRResponse,
+    ) -> None:
+        if not get_settings().debug_save_response:
+            return
+
+        debug_dir = get_settings().debug_dir
+        debug_dir.mkdir(exist_ok=True, parents=True)
+
+        payload = {
+            "request": {
+                "request_id": request_id,
+                "filename": filename,
+                "mode": mode,
+                "infographic": infographic,
+            },
+            "datalab_result": datalab_result,
+            "endpoint_response": json.loads(response.model_dump_json()),
+        }
+
+        safe_name = Path(filename or "upload").name or "upload"
+        stem = Path(safe_name).stem
+        suffix = Path(safe_name).suffix or ".bin"
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        req_prefix = f"{request_id}_" if request_id else ""
+        file_name = f"debug_{ts}_{req_prefix}{stem}_{mode}{suffix}.json"
+        target = debug_dir / file_name
+
+        with target.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+
+        logger.info("ocr_debug_saved request_id=%s path=%s", request_id, target)
 
     def _transform_response(
         self,
@@ -137,20 +201,47 @@ class OCRService:
         # Find page nodes
         page_nodes = [c for c in children if c.get("block_type") == "Page"]
 
+        # Read original image dimensions from source bytes for coordinate transform
+        orig_w, orig_h = 0, 0
+        if source_bytes:
+            try:
+                img = Image.open(io.BytesIO(source_bytes))
+                orig_w, orig_h = img.size
+            except Exception as exc:
+                logger.debug("ocr_source_image_read_failed error=%s", exc)
+
         pages: list[PageResult] = []
         block_counter = 0
 
         if not page_nodes:
-            # No page wrapper, process children directly
+            # No page wrapper, use defaults
+            page_width = 0
+            page_height = 0
             blocks = self._extract_blocks(
-                children, page_idx=0, counter_start=0, source_bytes=source_bytes
+                children,
+                page_idx=0,
+                counter_start=0,
+                source_bytes=source_bytes,
+                page_width=page_width,
+                page_height=page_height,
+                orig_w=orig_w,
+                orig_h=orig_h,
             )
             pages.append(PageResult(page_index=0, blocks=blocks))
         else:
             for page_idx, page_node in enumerate(page_nodes):
                 bbox = page_node.get("bbox", [])
-                page_width = int(bbox[2]) if len(bbox) >= 3 else 0
-                page_height = int(bbox[3]) if len(bbox) >= 4 else 0
+                page_width = max(0, int(bbox[2]) - int(bbox[0])) if len(bbox) >= 3 else 0
+                page_height = max(0, int(bbox[3]) - int(bbox[1])) if len(bbox) >= 4 else 0
+
+                logger.debug(
+                    "ocr_page page_index=%s page_width=%s page_height=%s orig_width=%s orig_height=%s",
+                    page_idx,
+                    page_width,
+                    page_height,
+                    orig_w,
+                    orig_h,
+                )
 
                 page_children = page_node.get("children", [])
                 start_counter = block_counter
@@ -159,6 +250,10 @@ class OCRService:
                     page_idx=page_idx,
                     counter_start=start_counter,
                     source_bytes=source_bytes,
+                    page_width=page_width,
+                    page_height=page_height,
+                    orig_w=orig_w,
+                    orig_h=orig_h,
                 )
                 block_counter = start_counter + len(blocks)
 
@@ -172,24 +267,31 @@ class OCRService:
                 )
 
         # Extract cost info
-        cost = CostBreakdown.from_datalab(datalab_result.get("cost_breakdown"))
+        cost_data = datalab_result.get("cost_breakdown") or {}
 
         # Remove base64 images from raw response to reduce size
         raw_response = self._strip_base64(datalab_result)
 
-        return OCRResponse(
+        response = OCRResponse(
             success=datalab_result.get("success", True),
             page_count=datalab_result.get("page_count", len(pages)),
             pages=pages,
             runtime_seconds=datalab_result.get("runtime"),
-            cost=cost,
+            cost_cents=cost_data.get("final_cost_cents"),
             raw=raw_response,
         )
 
+        logger.debug(
+            "ocr_transform_summary page_count=%s block_count=%s raw_keys=%s",
+            response.page_count,
+            sum(len(page.blocks) for page in response.pages),
+            sorted((response.raw or {}).keys())[:20],
+        )
+
+        return response
+
     def _strip_base64(self, data: dict[str, Any]) -> dict[str, Any]:
         """Clean raw response - remove base64, metadata thừa."""
-        import copy
-
         result = copy.deepcopy(data)
 
         # Fields to remove from top level
@@ -240,6 +342,10 @@ class OCRService:
         page_idx: int,
         counter_start: int,
         source_bytes: bytes | None = None,
+        page_width: int = 0,
+        page_height: int = 0,
+        orig_w: int = 0,
+        orig_h: int = 0,
     ) -> list[BlockContent]:
         """Extract blocks from Datalab tree structure."""
         blocks: list[BlockContent] = []
@@ -249,14 +355,11 @@ class OCRService:
             block_type = node.get("block_type", "")
             block_id = node.get("id", f"p{page_idx}_b{counter}")
 
-            # Skip empty pages
             if block_type == "Page":
                 continue
 
-            # Map Datalab block types to unified types
             unified_type = self._map_block_type(block_type)
 
-            # Extract text content
             text = ""
             html = node.get("html") or ""
 
@@ -267,16 +370,15 @@ class OCRService:
             else:
                 text = html_to_text(html)
 
-            # Extract polygon (fallback to bbox if not available)
             polygon_list = node.get("polygon")
             bbox_list = node.get("bbox", [])
 
-            polygon = None
+            polygon: Polygon | None = None
             if polygon_list and isinstance(polygon_list, list):
-                polygon = Polygon.from_list(polygon_list)
+                polygon = Polygon(points=polygon_list)
             elif bbox_list and len(bbox_list) == 4:
-                polygon = Polygon.from_list(
-                    [
+                polygon = Polygon(
+                    points=[
                         [bbox_list[0], bbox_list[1]],
                         [bbox_list[2], bbox_list[1]],
                         [bbox_list[2], bbox_list[3]],
@@ -284,24 +386,23 @@ class OCRService:
                     ]
                 )
 
-            image_ref: ImageRef | None = None
-            if (
-                block_type in ("Figure", "Image", "Picture")
-                and source_bytes
-                and bbox_list
-                and len(bbox_list) >= 4
-            ):
-                file_id = self._crop_and_save_figure(source_bytes, bbox_list, block_id)
-                if file_id:
-                    image_ref = ImageRef(
-                        file_id=file_id,
-                        url=f"/api/v1/files/{file_id}",
-                        description=text or "",
-                        caption=None,
-                    )
+            scale_x = 1.0
+            scale_y = 1.0
+            if polygon and orig_w and orig_h:
+                scale_x = orig_w / page_width if page_width else 1.0
+                scale_y = orig_h / page_height if page_height else 1.0
+                rotation = node.get("rotation") or 0
+                transformed_points = _transform_polygon_points(
+                    polygon_list=list(polygon.points),
+                    bbox_list=bbox_list,
+                    scale_x=scale_x,
+                    scale_y=scale_y,
+                    rotation=rotation,
+                    orig_w=orig_w,
+                    orig_h=orig_h,
+                )
+                polygon = Polygon(points=transformed_points)
 
-            # Create block
-            counter += 1
             block = BlockContent(
                 id=block_id,
                 block_type=unified_type,
@@ -309,19 +410,35 @@ class OCRService:
                 html=html if html else None,
                 polygon=polygon,
                 confidence=node.get("confidence", 1.0),
-                reading_order=counter,
-                language=node.get("language"),
-                image=image_ref,
             )
             blocks.append(block)
 
-            # Recursively process children
+            logger.debug(
+                "ocr_block page=%s id=%s type=%s text_len=%s polygon=%s scale=%.4f,%.4f",
+                page_idx,
+                block_id,
+                unified_type,
+                len(block.content),
+                [round(x, 2) for x in (polygon.points[0] + polygon.points[2])]
+                if polygon and polygon.points
+                else None,
+                scale_x,
+                scale_y,
+            )
+
+            counter += 1
+
+            # Recursively process children (don't increment counter for children blocks)
             for child in node.get("children", []):
                 child_blocks = self._extract_blocks(
                     [child],
                     page_idx=page_idx,
                     counter_start=counter,
                     source_bytes=source_bytes,
+                    page_width=page_width,
+                    page_height=page_height,
+                    orig_w=orig_w,
+                    orig_h=orig_h,
                 )
                 blocks.extend(child_blocks)
                 counter += len(child_blocks)
@@ -346,3 +463,42 @@ class OCRService:
             "SectionHeader": "text",
         }
         return type_mapping.get(datalab_type, "text")
+
+
+def _transform_polygon_points(
+    *,
+    polygon_list: list[Any] | None,
+    bbox_list: list[Any],
+    scale_x: float,
+    scale_y: float,
+    rotation: float,
+    orig_w: float,
+    orig_h: float,
+) -> list[list[float]]:
+    base_points = polygon_list if polygon_list is not None else [
+        [bbox_list[0], bbox_list[1]],
+        [bbox_list[2], bbox_list[1]],
+        [bbox_list[2], bbox_list[3]],
+        [bbox_list[0], bbox_list[3]],
+    ]
+
+    if not rotation and scale_x == 1.0 and scale_y == 1.0:
+        return [list(point) for point in base_points]
+
+    radians = math.radians(rotation % 360)
+    sin_r, cos_r = math.sin(radians), math.cos(radians)
+
+    center_x = orig_w / 2 if orig_w else 0.0
+    center_y = orig_h / 2 if orig_h else 0.0
+
+    transformed: list[list[float]] = []
+    for x, y in base_points:
+        sx = x * scale_x
+        sy = y * scale_y
+        dx = sx - center_x
+        dy = sy - center_y
+        rx = dx * cos_r - dy * sin_r
+        ry = dx * sin_r + dy * cos_r
+        transformed.append([rx + center_x, ry + center_y])
+
+    return transformed

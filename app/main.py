@@ -1,36 +1,52 @@
-"""FastAPI entrypoint."""
+"""FastAPI entrypoint for OCR service."""
 
 from __future__ import annotations
 
 import logging
+import os
+import platform
 import time
+import traceback
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, Response
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
-from app.api.routes.ocr import router as ocr_router
-from app.api.routes.storage import router as storage_router
+from app.api.routes.ocr import get_limiter, router as ocr_router
 
-load_dotenv()
+# Load .env file if it exists
+_env_path = Path(__file__).parent.parent / ".env"
+if _env_path.exists():
+    load_dotenv(_env_path)
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
 
 
-BASE_DIR = Path(__file__).resolve().parent
-templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage application lifecycle - startup and shutdown."""
+    logger.info("starting OCR service...")
+    yield
+    logger.info("shutting down OCR service...")
+    from app.api.routes.ocr import _get_async_client
+    await _get_async_client().aclose()
+    logger.info("shutdown complete")
+
 
 app = FastAPI(
     title="OCR Service",
     version="1.0.0",
+    lifespan=lifespan,
 )
 app.add_middleware(
     CORSMiddleware,
@@ -40,21 +56,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Serve static assets
-app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
-
 app.include_router(ocr_router)
-app.include_router(storage_router)
 
 
 @app.middleware("http")
-async def log_request_timing(request: Request, call_next) -> Response:
+async def log_request_timing(request: Request, call_next):
     start = time.perf_counter()
     try:
         response = await call_next(request)
         elapsed_ms = (time.perf_counter() - start) * 1000
         logger.info(
-            "request method=%s path=%s status=%s duration_ms=%.2f",
+            "method=%s path=%s status=%d duration_ms=%.2f",
             request.method,
             request.url.path,
             response.status_code,
@@ -64,7 +76,7 @@ async def log_request_timing(request: Request, call_next) -> Response:
     except Exception:
         elapsed_ms = (time.perf_counter() - start) * 1000
         logger.exception(
-            "request_error method=%s path=%s duration_ms=%.2f",
+            "method=%s path=%s duration_ms=%.2f",
             request.method,
             request.url.path,
             elapsed_ms,
@@ -72,11 +84,53 @@ async def log_request_timing(request: Request, call_next) -> Response:
         raise
 
 
-@app.get("/", response_class=HTMLResponse)
-def root(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
+class HealthResponse(BaseModel):
+    status: str
+    timestamp: str
+    version: str
+    python_version: str
+    platform: str
+    requests: dict
 
 
-@app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok"}
+@app.get("/health", response_model=HealthResponse)
+def health() -> HealthResponse:
+    """Health check endpoint with system info."""
+    try:
+        limiter_stats = get_limiter().get_stats()
+    except Exception:
+        limiter_stats = {"error": "limiter not initialized"}
+
+    return HealthResponse(
+        status="healthy",
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        version="1.0.0",
+        python_version=platform.python_version(),
+        platform=platform.platform(),
+        requests=limiter_stats,
+    )
+
+
+@app.get("/")
+def root() -> dict:
+    """Root endpoint with API info."""
+    return {
+        "service": "OCR Service",
+        "version": "1.0.0",
+        "docs": "/docs",
+        "health": "/health",
+    }
+
+
+@app.exception_handler(404)
+def not_found(_request: Request, _exc):
+    return JSONResponse({"detail": "Not Found"}, status_code=404)
+
+
+@app.exception_handler(500)
+def internal_error(request: Request, exc: Exception):
+    logger.exception("internal_error path=%s", request.url.path)
+    return JSONResponse(
+        {"detail": "Internal server error"},
+        status_code=500,
+    )

@@ -31,18 +31,36 @@ class DatalabClient:
         settings: Settings | None = None,
     ) -> None:
         self._keys = list(keys) if keys else load_api_keys()
-        self._idx = 0
         self._settings = settings or get_settings()
+        self._http: httpx.Client | None = None
+        self._key_idx = 0
 
     @property
     def _current_key(self) -> str:
-        if self._idx >= len(self._keys):
-            raise DatalabError("No API key available")
-        return self._keys[self._idx]
+        idx = self._key_idx % len(self._keys)
+        return self._keys[idx]
 
     def _rotate(self) -> None:
-        """Move to next key."""
-        self._idx = (self._idx + 1) % len(self._keys)
+        """Move to next key (caller must hold lock)."""
+        self._key_idx = (self._key_idx + 1) % len(self._keys)
+
+    def _get_client(self) -> httpx.Client:
+        """Lazily create shared HTTP client."""
+        if self._http is None or self._http.is_closed:
+            timeout = httpx.Timeout(
+                connect=10.0,
+                write=self._settings.http_timeout_sec,
+                read=self._settings.http_timeout_sec,
+                pool=10.0,
+            )
+            self._http = httpx.Client(timeout=timeout)
+        return self._http
+
+    def close(self) -> None:
+        """Close the HTTP client."""
+        if self._http is not None:
+            self._http.close()
+            self._http = None
 
     def convert(
         self,
@@ -54,7 +72,7 @@ class DatalabClient:
         mime: str | None = None,
     ) -> dict[str, Any]:
         """Upload file, poll until done, return result JSON."""
-        self._idx = 0
+        self._key_idx = 0
         max_retries = max(1, self._settings.max_retries)
         last_err: Exception | None = None
 
@@ -92,7 +110,6 @@ class DatalabClient:
         url = f"{self._settings.base_url}/convert"
         safe_name = self._safe_filename(filename)
 
-        # Determine MIME type
         if mime:
             final_mime = mime
         else:
@@ -100,23 +117,11 @@ class DatalabClient:
             if not final_mime:
                 final_mime = "application/octet-stream"
 
-        # Build request
-        timeout = httpx.Timeout(
-            connect=10.0,
-            write=self._settings.http_timeout_sec,
-            read=self._settings.http_timeout_sec,
-            pool=10.0,
-        )
-
         data: dict[str, Any] = {"mode": mode, "output_format": output_format}
         if extras:
             data["extras"] = extras
 
-        # Reuse client for connection pooling
-        if not hasattr(self, "_http"):
-            self._http = httpx.Client(timeout=timeout)
-        http = self._http
-
+        http = self._get_client()
         resp = http.post(
             url,
             headers={"X-API-Key": self._current_key},
@@ -137,12 +142,8 @@ class DatalabClient:
     def _poll(self, check_url: str) -> dict[str, Any]:
         """Poll check_url until conversion is complete."""
         deadline = time.monotonic() + self._settings.poll_timeout_sec
-        timeout = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0)
 
-        # Reuse client for connection pooling
-        if not hasattr(self, "_http"):
-            self._http = httpx.Client(timeout=timeout)
-        http = self._http
+        http = self._get_client()
 
         while time.monotonic() < deadline:
             resp = http.get(check_url, headers={"X-API-Key": self._current_key})
@@ -170,4 +171,5 @@ class DatalabClient:
             base, ext = base.rsplit(".", 1)
             ext = ext.lower()
         base = SAFE_FILENAME_RE.sub("_", base).strip("._-") or "upload"
+        ext = SAFE_FILENAME_RE.sub("_", ext) or "png"
         return f"{base}.{ext}"
