@@ -1,5 +1,3 @@
-"""OCR API schemas."""
-
 from __future__ import annotations
 
 from typing import Any
@@ -8,12 +6,10 @@ from pydantic import BaseModel, Field
 
 
 class Polygon(BaseModel):
-    """Polygon coordinates as list of [x, y] points."""
     points: list[list[float]]
 
 
 class BlockContent(BaseModel):
-    """OCR content block."""
     id: str
     block_type: str
     content: str
@@ -23,7 +19,6 @@ class BlockContent(BaseModel):
 
 
 class PageResult(BaseModel):
-    """OCR result for a single page."""
     page_index: int = Field(ge=0)
     width: int = Field(default=0, ge=0)
     height: int = Field(default=0, ge=0)
@@ -31,7 +26,6 @@ class PageResult(BaseModel):
 
 
 class OCRResponse(BaseModel):
-    """Unified OCR response schema."""
     success: bool = True
     page_count: int = Field(default=0, ge=0)
     pages: list[PageResult] = Field(default_factory=list)

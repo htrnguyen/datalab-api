@@ -1,5 +1,3 @@
-"""OCR service - handles Datalab API calls and response transformation."""
-
 from __future__ import annotations
 
 import copy
@@ -15,12 +13,7 @@ from typing import Any
 from PIL import Image
 
 from app.core.config import get_settings
-from app.schemas.ocr import (
-    BlockContent,
-    OCRResponse,
-    PageResult,
-    Polygon,
-)
+from app.schemas.ocr import BlockContent, OCRResponse, PageResult, Polygon
 from app.services.datalab_client import DatalabClient
 from app.services.html_clean import html_to_text
 
@@ -28,8 +21,6 @@ logger = logging.getLogger(__name__)
 
 
 class OCRService:
-    """Service for OCR processing via Datalab API."""
-
     def __init__(self, datalab_client: DatalabClient):
         self._client = datalab_client
 
@@ -41,15 +32,6 @@ class OCRService:
         infographic: bool = False,
         request_id: str | None = None,
     ) -> OCRResponse:
-        """Process file through Datalab API and return unified response.
-
-        Args:
-            file_bytes: Raw file content
-            filename: Original filename
-            mode: Processing mode (fast, balanced, accurate)
-            infographic: Extract table structure with line-by-line breakdown
-            request_id: Optional request ID for tracing
-        """
         settings = get_settings()
         size_bytes = len(file_bytes)
         size_mb = size_bytes / (1024 * 1024)
@@ -118,9 +100,7 @@ class OCRService:
                 orig_width, orig_height = Image.open(io.BytesIO(file_bytes)).size
             except Exception as exc:
                 logger.debug("ocr_orig_image_size_failed error=%s", exc)
-        page_sizes = [
-            f"{page.width}x{page.height}" for page in response.pages
-        ] or ["0x0"]
+        page_sizes = [f"{page.width}x{page.height}" for page in response.pages] or ["0x0"]
         logger.info(
             "ocr_transform_done request_id=%s filename=%s size_bytes=%s page_count=%s block_count=%s block_types=%s runtime_seconds=%s cost_cents=%s orig_size=%s page_sizes=%s",
             request_id,
@@ -145,7 +125,7 @@ class OCRService:
                     datalab_result=result,
                     response=response,
                 )
-            except Exception as exc:  # pragma: no cover - best-effort debug
+            except Exception as exc:
                 logger.debug("ocr_debug_save_failed request_id=%s: %s", request_id, exc)
 
         return response
@@ -194,14 +174,11 @@ class OCRService:
         datalab_result: dict[str, Any],
         source_bytes: bytes | None = None,
     ) -> OCRResponse:
-        """Transform Datalab response to unified OCRResponse schema."""
         json_tree = datalab_result.get("json", {})
         children = json_tree.get("children", [])
 
-        # Find page nodes
         page_nodes = [c for c in children if c.get("block_type") == "Page"]
 
-        # Read original image dimensions from source bytes for coordinate transform
         orig_w, orig_h = 0, 0
         if source_bytes:
             try:
@@ -214,7 +191,6 @@ class OCRService:
         block_counter = 0
 
         if not page_nodes:
-            # No page wrapper, use defaults
             page_width = 0
             page_height = 0
             blocks = self._extract_blocks(
@@ -266,10 +242,7 @@ class OCRService:
                     )
                 )
 
-        # Extract cost info
         cost_data = datalab_result.get("cost_breakdown") or {}
-
-        # Remove base64 images from raw response to reduce size
         raw_response = self._strip_base64(datalab_result)
 
         response = OCRResponse(
@@ -291,10 +264,8 @@ class OCRService:
         return response
 
     def _strip_base64(self, data: dict[str, Any]) -> dict[str, Any]:
-        """Clean raw response - remove base64, metadata thừa."""
         result = copy.deepcopy(data)
 
-        # Fields to remove from top level
         result.pop("images", None)
         result.pop("markdown", None)
         result.pop("html", None)
@@ -307,7 +278,6 @@ class OCRService:
         result.pop("versions", None)
         result.pop("evaluation", None)
 
-        # Clean nested nodes
         def strip_node(node: dict):
             node.pop("images", None)
             node.pop("markdown", None)
@@ -347,7 +317,6 @@ class OCRService:
         orig_w: int = 0,
         orig_h: int = 0,
     ) -> list[BlockContent]:
-        """Extract blocks from Datalab tree structure."""
         blocks: list[BlockContent] = []
         counter = counter_start
 
@@ -428,7 +397,6 @@ class OCRService:
 
             counter += 1
 
-            # Recursively process children (don't increment counter for children blocks)
             for child in node.get("children", []):
                 child_blocks = self._extract_blocks(
                     [child],
@@ -446,7 +414,6 @@ class OCRService:
         return blocks
 
     def _map_block_type(self, datalab_type: str) -> str:
-        """Map Datalab block type to unified type."""
         type_mapping = {
             "Text": "text",
             "Table": "table",

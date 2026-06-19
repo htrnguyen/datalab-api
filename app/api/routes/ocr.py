@@ -1,7 +1,3 @@
-"""OCR API routes with production-ready features."""
-
-from __future__ import annotations
-
 import asyncio
 import logging
 import mimetypes
@@ -14,7 +10,6 @@ from typing import Annotated
 
 import httpx
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
-from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from app.core.config import Settings, get_settings
 from app.schemas.ocr import OCRResponse
@@ -30,7 +25,6 @@ SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
 def _safe_filename(fn: str) -> str:
-    """Sanitize filename for multipart upload."""
     base = (fn or "upload").strip()
     ext = "png"
     if "." in base:
@@ -42,7 +36,6 @@ def _safe_filename(fn: str) -> str:
 
 
 def _get_extension(filename: str | None) -> str:
-    """Get lowercase file extension without dot."""
     if not filename:
         return ""
     ext = Path(filename).suffix.lower().lstrip(".")
@@ -50,8 +43,6 @@ def _get_extension(filename: str | None) -> str:
 
 
 class RequestLimiter:
-    """Simple counter-based request limiter."""
-
     def __init__(self, max_concurrent: int = 5):
         self._max = max_concurrent
         self._active = 0
@@ -60,7 +51,6 @@ class RequestLimiter:
         self._total_rejected = 0
 
     async def acquire(self) -> tuple[bool, float]:
-        """Try to acquire slot. Returns (acquired, wait_time)."""
         self._total_requests += 1
         wait_start = time.perf_counter()
 
@@ -73,7 +63,6 @@ class RequestLimiter:
             return True, wait_time
 
     async def release(self) -> None:
-        """Release slot."""
         async with self._lock:
             self._active = max(0, self._active - 1)
 
@@ -98,8 +87,6 @@ def get_limiter() -> RequestLimiter:
 
 
 class AsyncDatalabClient(DatalabClient):
-    """Async version using httpx.AsyncClient."""
-
     async def convert_async(
         self,
         file_bytes: bytes,
@@ -109,7 +96,6 @@ class AsyncDatalabClient(DatalabClient):
         extras: str | None = None,
         mime: str | None = None,
     ) -> dict:
-        """Upload file, poll until done, return result JSON (async)."""
         self._key_idx = 0
         max_retries = max(1, self._settings.max_retries)
         last_err: Exception | None = None
@@ -154,7 +140,6 @@ class AsyncDatalabClient(DatalabClient):
         extras: str | None,
         mime: str | None,
     ) -> dict:
-        """Single async convert attempt."""
         url = f"{self._settings.base_url}/convert"
 
         if mime:
@@ -187,7 +172,6 @@ class AsyncDatalabClient(DatalabClient):
         return await self._poll_async(body["request_check_url"])
 
     async def _poll_async(self, check_url: str) -> dict:
-        """Poll check_url until conversion is complete (async)."""
         deadline = time.monotonic() + self._settings.poll_timeout_sec
         http = await self._get_async_client()
 
@@ -199,21 +183,16 @@ class AsyncDatalabClient(DatalabClient):
             status = result.get("status")
             if status == "complete":
                 if not result.get("success", True):
-                    raise DatalabError(
-                        f"Conversion failed: {result.get('error', 'unknown')}"
-                    )
+                    raise DatalabError(f"Conversion failed: {result.get('error', 'unknown')}")
                 return result
             if status == "failed":
-                raise DatalabError(
-                    f"Conversion failed: {result.get('error', 'unknown')}"
-                )
+                raise DatalabError(f"Conversion failed: {result.get('error', 'unknown')}")
 
             await asyncio.sleep(self._settings.poll_interval_sec)
 
         raise DatalabError("Conversion timed out")
 
     async def _get_async_client(self) -> httpx.AsyncClient:
-        """Lazily create shared async HTTP client."""
         if not hasattr(self, "_async_http") or self._async_http.is_closed:
             timeout = httpx.Timeout(
                 connect=10.0,
@@ -226,15 +205,12 @@ class AsyncDatalabClient(DatalabClient):
         return self._async_http
 
     async def aclose(self) -> None:
-        """Close async HTTP client."""
         if hasattr(self, "_async_http"):
             await self._async_http.aclose()
             del self._async_http
 
 
 class AsyncOCRService(OCRService):
-    """Async OCR service - inherits transform logic from OCRService."""
-
     def __init__(self, client: AsyncDatalabClient):
         super().__init__(client)
 
@@ -246,9 +222,6 @@ class AsyncOCRService(OCRService):
         infographic: bool = False,
         request_id: str | None = None,
     ) -> OCRResponse:
-        """Process file through Datalab API (async)."""
-        from collections import Counter
-
         settings = get_settings()
         size_bytes = len(file_bytes)
         size_mb = size_bytes / (1024 * 1024)
@@ -274,9 +247,7 @@ class AsyncOCRService(OCRService):
                 mime=None,
             )
         except Exception as exc:
-            logger.exception(
-                "ocr_datalab_failed request_id=%s filename=%s", request_id, filename
-            )
+            logger.exception("ocr_datalab_failed request_id=%s filename=%s", request_id, filename)
             raise
 
         elapsed_ms = (time.perf_counter() - start) * 1000
@@ -290,9 +261,7 @@ class AsyncOCRService(OCRService):
         try:
             response = self._transform_response(result, file_bytes)
         except Exception as exc:
-            logger.exception(
-                "ocr_transform_failed request_id=%s filename=%s", request_id, filename
-            )
+            logger.exception("ocr_transform_failed request_id=%s filename=%s", request_id, filename)
             raise
 
         total_ms = (time.perf_counter() - start) * 1000
@@ -307,9 +276,7 @@ class AsyncOCRService(OCRService):
 
         if settings.debug_log_enabled:
             try:
-                self._save_debug_payload(
-                    request_id, filename, mode, infographic, result, response
-                )
+                self._save_debug_payload(request_id, filename, mode, infographic, result, response)
             except Exception as exc:
                 logger.debug("ocr_debug_save_failed request_id=%s: %s", request_id, exc)
 
@@ -326,7 +293,6 @@ def _get_async_service() -> AsyncOCRService:
 
 
 def get_ocr_service() -> AsyncOCRService:
-    """Dependency for OCR service."""
     return _get_async_service()
 
 
@@ -340,11 +306,10 @@ async def process_ocr(
     ] = "accurate",
     infographic: Annotated[
         bool,
-        Query(description="Extract table structure with line-by-line breakdown"),
+        Query(description="Enable infographic mode"),
     ] = False,
     service: AsyncOCRService = Depends(get_ocr_service),
 ) -> OCRResponse:
-    """Process OCR on uploaded file."""
     request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())[:8]
     settings = get_settings()
     limiter = get_limiter()
@@ -353,7 +318,6 @@ async def process_ocr(
     if not raw:
         raise HTTPException(status_code=400, detail="Empty file")
 
-    # File size validation
     size_mb = len(raw) / (1024 * 1024)
     if size_mb > settings.max_upload_size_mb:
         raise HTTPException(
@@ -361,7 +325,6 @@ async def process_ocr(
             detail=f"File too large ({size_mb:.1f}MB). Max: {settings.max_upload_size_mb:.0f}MB",
         )
 
-    # File extension validation
     ext = _get_extension(file.filename)
     if ext not in settings.allowed_extensions:
         raise HTTPException(
@@ -369,14 +332,12 @@ async def process_ocr(
             detail=f"Unsupported file type: .{ext}. Allowed: {', '.join(sorted(settings.allowed_extensions))}",
         )
 
-    # Mode validation
     if mode not in VALID_MODES:
         raise HTTPException(
             status_code=400,
             detail=f"Invalid mode: {mode}. Must be one of: {', '.join(VALID_MODES)}",
         )
 
-    # Rate limiting
     acquired, wait_time = await limiter.acquire()
     if not acquired:
         raise HTTPException(

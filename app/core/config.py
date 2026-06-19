@@ -1,5 +1,3 @@
-"""Load Datalab API keys and tunables from environment."""
-
 from __future__ import annotations
 
 import os
@@ -17,7 +15,6 @@ def _split_keys(raw: str) -> list[str]:
 
 
 def load_api_keys() -> list[str]:
-    """Keys from DATALAB_API_KEYS as comma-separated list."""
     bulk = os.getenv("DATALAB_API_KEYS", "")
     keys = _split_keys(bulk)
     if not keys:
@@ -50,7 +47,7 @@ def get_settings() -> Settings:
     debug_log_enabled = os.getenv("DEBUG_LOG_ENABLED", "true").lower() not in {"0", "false", "no"}
     debug_save_response = os.getenv("DEBUG_SAVE_RESPONSE", "false").lower() in {"1", "true", "yes"}
     max_concurrent = int(os.getenv("MAX_CONCURRENT_REQUESTS", "5"))
-    
+
     allowed_raw = os.getenv("ALLOWED_EXTENSIONS", "")
     if allowed_raw:
         allowed = frozenset(ext.strip().lower() for ext in allowed_raw.split(",") if ext.strip())

@@ -1,12 +1,9 @@
-"""FastAPI entrypoint for OCR service."""
-
 from __future__ import annotations
 
 import logging
 import os
 import platform
 import time
-import traceback
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,7 +16,6 @@ from pydantic import BaseModel
 
 from app.api.routes.ocr import get_limiter, router as ocr_router
 
-# Load .env file if it exists
 _env_path = Path(__file__).parent.parent / ".env"
 if _env_path.exists():
     load_dotenv(_env_path)
@@ -34,7 +30,6 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Manage application lifecycle - startup and shutdown."""
     logger.info("starting OCR service...")
     yield
     logger.info("shutting down OCR service...")
@@ -95,7 +90,6 @@ class HealthResponse(BaseModel):
 
 @app.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
-    """Health check endpoint with system info."""
     try:
         limiter_stats = get_limiter().get_stats()
     except Exception:
@@ -111,15 +105,70 @@ def health() -> HealthResponse:
     )
 
 
-@app.get("/")
-def root() -> dict:
-    """Root endpoint with API info."""
-    return {
-        "service": "OCR Service",
-        "version": "1.0.0",
-        "docs": "/docs",
-        "health": "/health",
-    }
+class InfoResponse(BaseModel):
+    service: str
+    version: str
+    docs: str
+    health: str
+    usage: dict
+
+
+@app.get("/", response_model=InfoResponse)
+def root() -> InfoResponse:
+    return InfoResponse(
+        service="OCR Service",
+        version="1.0.0",
+        docs="/docs",
+        health="/health",
+        usage={
+            "endpoints": {
+                "ocr": {
+                    "method": "POST",
+                    "path": "/api/v1/ocr",
+                    "params": {
+                        "mode": "fast | balanced | accurate (default: accurate)",
+                        "infographic": "true | false (default: false)",
+                    },
+                    "file_types": "PNG, JPG, WEBP, PDF",
+                    "examples": [
+                        {
+                            "description": "Basic OCR (accurate mode)",
+                            "curl": (
+                                "curl -X POST 'http://localhost:4242/api/v1/ocr?mode=accurate&infographic=false' "
+                                "-H 'accept: application/json' "
+                                "-H 'Content-Type: multipart/form-data' "
+                                "-F 'file=@image.png;type=image/png'"
+                            ),
+                        },
+                        {
+                            "description": "Fast mode",
+                            "curl": (
+                                "curl -X POST 'http://localhost:4242/api/v1/ocr?mode=fast' "
+                                "-F 'file=@document.pdf'"
+                            ),
+                        },
+                        {
+                            "description": "Infographic mode for diagrams",
+                            "curl": (
+                                "curl -X POST 'http://localhost:4242/api/v1/ocr?mode=accurate&infographic=true' "
+                                "-F 'file=@diagram.png'"
+                            ),
+                        },
+                    ],
+                },
+                "stats": {
+                    "method": "GET",
+                    "path": "/api/v1/ocr/stats",
+                    "description": "Get rate limiter statistics",
+                },
+                "health": {
+                    "method": "GET",
+                    "path": "/health",
+                    "description": "Health check",
+                },
+            },
+        },
+    )
 
 
 @app.exception_handler(404)

@@ -1,5 +1,3 @@
-"""Datalab /convert API client with retry and key rotation."""
-
 from __future__ import annotations
 
 import logging
@@ -19,12 +17,10 @@ SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
 class DatalabError(RuntimeError):
-    """Conversion failed or all keys exhausted."""
+    pass
 
 
 class DatalabClient:
-    """Submit files to Datalab /convert and poll until complete."""
-
     def __init__(
         self,
         keys: list[str] | None = None,
@@ -41,11 +37,9 @@ class DatalabClient:
         return self._keys[idx]
 
     def _rotate(self) -> None:
-        """Move to next key (caller must hold lock)."""
         self._key_idx = (self._key_idx + 1) % len(self._keys)
 
     def _get_client(self) -> httpx.Client:
-        """Lazily create shared HTTP client."""
         if self._http is None or self._http.is_closed:
             timeout = httpx.Timeout(
                 connect=10.0,
@@ -57,7 +51,6 @@ class DatalabClient:
         return self._http
 
     def close(self) -> None:
-        """Close the HTTP client."""
         if self._http is not None:
             self._http.close()
             self._http = None
@@ -71,7 +64,6 @@ class DatalabClient:
         extras: str | None = None,
         mime: str | None = None,
     ) -> dict[str, Any]:
-        """Upload file, poll until done, return result JSON."""
         self._key_idx = 0
         max_retries = max(1, self._settings.max_retries)
         last_err: Exception | None = None
@@ -106,7 +98,6 @@ class DatalabClient:
         extras: str | None,
         mime: str | None,
     ) -> dict[str, Any]:
-        """Single convert attempt: upload + poll."""
         url = f"{self._settings.base_url}/convert"
         safe_name = self._safe_filename(filename)
 
@@ -140,7 +131,6 @@ class DatalabClient:
         return self._poll(body["request_check_url"])
 
     def _poll(self, check_url: str) -> dict[str, Any]:
-        """Poll check_url until conversion is complete."""
         deadline = time.monotonic() + self._settings.poll_timeout_sec
 
         http = self._get_client()
@@ -164,7 +154,6 @@ class DatalabClient:
 
     @staticmethod
     def _safe_filename(filename: str) -> str:
-        """Sanitize filename for multipart upload."""
         base = (filename or "upload").strip()
         ext = "png"
         if "." in base:

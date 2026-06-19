@@ -12,131 +12,32 @@ FastAPI service for OCR using Datalab API with async processing, line-level outp
 
 ## Quick Start
 
+### Docker (Recommended)
+
 ```bash
-# Install dependencies
+cp .env.docker .env
+docker compose up -d --build
+```
+
+API: http://localhost:4242
+
+### Python (Development)
+
+```bash
 pip install -r requirements.txt
-
-# Configure API keys
-cp .env.example .env
-# Edit .env and add: DATALAB_API_KEYS=your_api_key
-
-# Run server
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+cp .env.docker .env
+uvicorn app.main:app --reload --host 0.0.0.0 --port 4242
 ```
 
-For production with multiple workers:
+## Docker Commands
+
 ```bash
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4
+docker compose up -d --build
+docker compose logs -f
+docker compose down
 ```
 
-## API Endpoints
-
-### POST /api/v1/ocr
-
-Process an image or PDF file for OCR.
-
-**Request:**
-```
-POST /api/v1/ocr
-Content-Type: multipart/form-data
-```
-
-| Parameter | Type | Location | Required | Default | Description |
-|-----------|------|----------|---------|---------|-------------|
-| `file` | UploadFile | form | Yes | - | Image (PNG, JPG, WEBP) or PDF file |
-| `mode` | string | query | No | accurate | Processing mode: `fast`, `balanced`, `accurate` |
-| `infographic` | bool | query | No | false | Enable infographic mode |
-
-**cURL Examples:**
-```bash
-# Basic OCR
-curl -X POST "http://localhost:8000/api/v1/ocr" \
-  -F "file=@document.pdf"
-
-# Fast mode
-curl -X POST "http://localhost:8000/api/v1/ocr?mode=fast" \
-  -F "file=@image.png"
-
-# Infographic mode
-curl -X POST "http://localhost:8000/api/v1/ocr?mode=accurate&infographic=true" \
-  -F "file=@infographic.png"
-```
-
-**Response:**
-```json
-{
-  "success": true,
-  "request_id": "req_abc123def456",
-  "result": {
-    "request_id": "req_abc123def456",
-    "status": "done",
-    "mode": "accurate",
-    "extras": ["infographic"],
-    "page_count": 1,
-    "metadata": {
-      "filename": "document.pdf",
-      "file_size": 1024000,
-      "mime_type": "application/pdf",
-      "page_count": 1,
-      "total_lines": 25,
-      "languages": ["en"],
-      "processed_at": "2026-06-17T13:45:00"
-    },
-    "pages": [
-      {
-        "page_index": 0,
-        "width": 2480,
-        "height": 3508,
-        "lines": [
-          {
-            "id": "p0_l1",
-            "text": "Invoice #12345",
-            "block_type": "title",
-            "bbox": [120, 180, 430, 220],
-            "polygon": [[120,180],[430,180],[430,220],[120,220]],
-            "confidence": 0.997,
-            "reading_order": 1,
-            "language": "en",
-            "page": 0
-          }
-        ]
-      }
-    ]
-  }
-}
-```
-
-### GET /api/v1/ocr/stats
-
-Get current rate limiter statistics.
-
-**Response:**
-```json
-{
-  "active": 2,
-  "max": 5,
-  "total_requests": 150,
-  "total_rejected": 0
-}
-```
-
-### GET /health
-
-Health check endpoint.
-
-## Processing Modes
-
-| Mode | Description | Use Case |
-|------|-------------|----------|
-| `fast` | Low latency | Quick previews, high-volume processing |
-| `balanced` | Balanced speed/quality | General purpose |
-| `accurate` | Highest quality | Complex layouts, infographics, archives |
-
-**Recommendation:** Use `accurate` for best OCR results, especially for complex documents.
-
-## Configuration
-
-Copy `.env.example` to `.env` and configure:
+## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -145,46 +46,169 @@ Copy `.env.example` to `.env` and configure:
 | `DATALAB_POLL_INTERVAL` | `2` | Poll interval in seconds |
 | `DATALAB_POLL_TIMEOUT` | `120` | Poll timeout in seconds |
 | `DATALAB_HTTP_TIMEOUT` | `90` | HTTP request timeout in seconds |
-| `DATALAB_MAX_RETRIES` | `2` | Max retry attempts |
 | `MAX_UPLOAD_SIZE_MB` | `50` | Max upload file size in MB |
-| `MAX_CONCURRENT_REQUESTS` | `5` | Max concurrent requests (rate limiting) |
-| `DEBUG_LOG_ENABLED` | `false` | Enable debug logging |
+| `MAX_CONCURRENT_REQUESTS` | `5` | Max concurrent requests |
+
+## API Endpoints
+
+### POST /api/v1/ocr
+
+Process an image or PDF file for OCR.
+
+| Parameter | Type | Location | Required | Default | Description |
+|-----------|------|----------|---------|---------|-------------|
+| `file` | UploadFile | form | Yes | - | Image (PNG, JPG, WEBP) or PDF file |
+| `mode` | string | query | No | accurate | Processing mode: `fast`, `balanced`, `accurate` |
+| `infographic` | bool | query | No | false | Enable infographic mode |
+
+### cURL Examples
+
+**Basic OCR with accurate mode:**
+
+```bash
+curl -X POST \
+  'http://localhost:4242/api/v1/ocr?mode=accurate&infographic=false' \
+  -H 'accept: application/json' \
+  -H 'Content-Type: multipart/form-data' \
+  -F 'file=@image.png;type=image/png'
+```
+
+**Fast mode:**
+
+```bash
+curl -X POST \
+  'http://localhost:4242/api/v1/ocr?mode=fast' \
+  -F 'file=@document.pdf'
+```
+
+**Infographic mode for diagrams:**
+
+```bash
+curl -X POST \
+  'http://localhost:4242/api/v1/ocr?mode=accurate&infographic=true' \
+  -F 'file=@diagram.png'
+```
+
+### Response Example
+
+```json
+{
+  "success": true,
+  "page_count": 1,
+  "pages": [
+    {
+      "page_index": 0,
+      "width": 2464,
+      "height": 1540,
+      "blocks": [
+        {
+          "id": "/page/0/Text/0",
+          "block_type": "text",
+          "content": "挑戰題*21* 1. 大的表面积, 2. 薄的交换表面...",
+          "confidence": 1,
+          "polygon": {
+            "points": [
+              [56.94, 40.40],
+              [683.66, 40.40],
+              [683.66, 82.80],
+              [56.94, 82.80]
+            ]
+          },
+          "html": "<p>挑戰題*21* 1. 大的表面积, 2. 薄的交换表面...</p>"
+        }
+      ]
+    }
+  ],
+  "runtime_seconds": 3.53,
+  "cost_cents": 1
+}
+```
+
+**Response Fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `success` | bool | Whether OCR succeeded |
+| `page_count` | int | Number of pages processed |
+| `pages` | array | Array of page results |
+| `pages[].page_index` | int | Page number (0-indexed) |
+| `pages[].width` | int | Page width in pixels |
+| `pages[].height` | int | Page height in pixels |
+| `pages[].blocks` | array | Array of text blocks detected |
+| `blocks[].id` | string | Unique block identifier |
+| `blocks[].block_type` | string | Block type (e.g., "text") |
+| `blocks[].content` | string | Extracted text content |
+| `blocks[].confidence` | float | Confidence score (0-1) |
+| `blocks[].polygon.points` | array | Bounding polygon coordinates |
+| `blocks[].html` | string | HTML formatted text |
+| `runtime_seconds` | float | Processing time in seconds |
+| `cost_cents` | int | Estimated cost in cents |
+
+### GET /api/v1/ocr/stats
+
+Get current rate limiter statistics.
+
+```json
+{
+  "active_requests": 2,
+  "queued_requests": 0,
+  "max_concurrent": 5
+}
+```
+
+### GET /health
+
+Health check endpoint.
+
+```json
+{"status": "healthy"}
+```
+
+## Processing Modes
+
+| Mode | Description | Use Case |
+|------|-------------|----------|
+| `fast` | Low latency | Quick previews, high-volume processing |
+| `balanced` | Balanced speed/quality | General purpose |
+| `accurate` | Highest quality | Complex layouts, infographics |
 
 ## Client Examples
 
 ### Python
+
 ```python
 import requests
 
 with open("document.pdf", "rb") as f:
     response = requests.post(
-        "http://localhost:8000/api/v1/ocr",
+        "http://localhost:4242/api/v1/ocr",
         files={"file": f},
         params={"mode": "accurate", "infographic": True}
     )
 
 data = response.json()
 if data["success"]:
-    for page in data["result"]["pages"]:
-        for line in page["lines"]:
-            print(f"{line['text']} (conf: {line['confidence']:.2f})")
+    for page in data["pages"]:
+        for block in page["blocks"]:
+            print(f"[{block['confidence']:.0%}] {block['content']}")
 ```
 
 ### JavaScript
+
 ```javascript
 const formData = new FormData();
 formData.append('file', fileInput.files[0]);
 
-const response = await fetch('http://localhost:8000/api/v1/ocr?mode=accurate', {
+const response = await fetch('http://localhost:4242/api/v1/ocr?mode=accurate', {
   method: 'POST',
   body: formData
 });
 
 const data = await response.json();
 if (data.success) {
-  data.result.pages.forEach(page => {
-    page.lines.forEach(line => {
-      console.log(`${line.text} (conf: ${line.confidence.toFixed(2)})`);
+  data.pages.forEach(page => {
+    page.blocks.forEach(block => {
+      console.log(`[${(block.confidence * 100).toFixed(0)}%] ${block.content}`);
     });
   });
 }
@@ -193,12 +217,5 @@ if (data.success) {
 ## Architecture
 
 ```
-┌─────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│   Client    │────▶│  FastAPI Server │────▶│   Datalab API   │
-│             │     │  (Async OCR)    │     │   (Cloud)       │
-└─────────────┘     └─────────────────┘     └─────────────────┘
+Client → FastAPI Server → Datalab API
 ```
-
-## License
-
-MIT
