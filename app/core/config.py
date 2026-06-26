@@ -1,8 +1,18 @@
+"""Application configuration and settings."""
 from __future__ import annotations
 
+import asyncio
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+
+import httpx
+
+logger = logging.getLogger(__name__)
+
+HEALTH_URL = "https://www.datalab.to/api/v1/health"
+HEALTH_TIMEOUT = 10.0
 
 
 def _split_keys(raw: str) -> list[str]:
@@ -14,6 +24,73 @@ def _split_keys(raw: str) -> list[str]:
     return parts
 
 
+async def _check_key_health(api_key: str) -> tuple[str, bool]:
+    """Check if an API key is valid by calling /health endpoint.
+
+    Returns:
+        Tuple of (api_key, is_valid)
+    """
+    try:
+        async with httpx.AsyncClient(timeout=HEALTH_TIMEOUT) as client:
+            resp = await client.get(
+                HEALTH_URL,
+                headers={"X-Api-Key": api_key},
+            )
+            is_valid = resp.status_code == 200
+            return api_key, is_valid
+    except Exception as e:
+        logger.warning("Key health check failed: %s", e)
+        return api_key, False
+
+
+async def validate_api_keys(api_keys: list[str]) -> list[str]:
+    """Validate all API keys concurrently, return only valid ones.
+
+    Args:
+        api_keys: List of API keys to validate
+
+    Returns:
+        List of valid API keys only
+    """
+    if not api_keys:
+        return []
+
+    results = await asyncio.gather(*[_check_key_health(k) for k in api_keys])
+
+    valid_keys = []
+    invalid_count = 0
+
+    for key, is_valid in results:
+        if is_valid:
+            valid_keys.append(key)
+        else:
+            invalid_count += 1
+            masked = f"{key[:6]}...{key[-4:]}" if len(key) > 12 else "***"
+            logger.warning("Invalid API key detected and removed: %s", masked)
+
+    total = len(api_keys)
+    logger.info(
+        "API key validation: %d/%d valid",
+        len(valid_keys),
+        total,
+    )
+
+    if invalid_count:
+        logger.warning(
+            "Removed %d invalid key(s). %d key(s) remaining.",
+            invalid_count,
+            len(valid_keys),
+        )
+
+    if not valid_keys:
+        raise RuntimeError(
+            f"All {total} API keys failed validation. "
+            "Check your DATALAB_API_KEYS environment variable."
+        )
+
+    return valid_keys
+
+
 def load_api_keys() -> list[str]:
     bulk = os.getenv("DATALAB_API_KEYS", "")
     keys = _split_keys(bulk)
@@ -21,6 +98,16 @@ def load_api_keys() -> list[str]:
         msg = "Set DATALAB_API_KEYS in environment (comma-separated)."
         raise RuntimeError(msg)
     return keys
+
+
+async def load_and_validate_api_keys() -> list[str]:
+    """Load and validate API keys on startup.
+
+    Returns:
+        List of valid API keys
+    """
+    keys = load_api_keys()
+    return await validate_api_keys(keys)
 
 
 ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "gif", "bmp", "pdf", "tiff", "tif"}

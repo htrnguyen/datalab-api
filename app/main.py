@@ -5,7 +5,7 @@ import os
 import platform
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from app.api.routes.ocr import get_limiter, router as ocr_router
+from app.api.routes.extraction import router as extraction_router
 
 _env_path = Path(__file__).parent.parent / ".env"
 if _env_path.exists():
@@ -24,17 +25,50 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[logging.StreamHandler()],
 )
+_tz_utc7 = timedelta(hours=7)
+
+
+class _UTC7Formatter(logging.Formatter):
+    def formatTime(self, record, datefmt=None):
+        dt = datetime.fromtimestamp(record.created, tz=timezone.utc) + _tz_utc7
+        return dt.strftime(datefmt or "%Y-%m-%d %H:%M:%S")
+
+
+for _handler in logging.root.handlers:
+    _handler.setFormatter(
+        _UTC7Formatter(
+            "%(asctime)s %(levelname)s [%(name)s] %(message)s", "%Y-%m-%d %H:%M:%S"
+        )
+    )
 logger = logging.getLogger(__name__)
+
+# Suppress verbose httpx/httpcore poll logs (only show errors)
+for _lib in ("httpx", "httpcore"):
+    _l = logging.getLogger(_lib)
+    _l.setLevel(logging.WARNING)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("starting OCR service...")
+    logger.info("validating API keys...")
+    try:
+        from app.api.routes.extraction import _get_client
+
+        await _get_client()
+        logger.info("API key validation complete")
+    except Exception as e:
+        logger.error("API key validation failed: %s", e)
     yield
     logger.info("shutting down OCR service...")
     from app.api.routes.ocr import _get_async_client
+
     await _get_async_client().aclose()
+    from app.services.extraction_client import ExtractionClient
+
+    await ExtractionClient.shutdown_all()
     logger.info("shutdown complete")
 
 
@@ -52,6 +86,7 @@ app.add_middleware(
 )
 
 app.include_router(ocr_router)
+app.include_router(extraction_router)
 
 
 @app.middleware("http")
@@ -160,6 +195,26 @@ def root() -> InfoResponse:
                     "method": "GET",
                     "path": "/api/v1/ocr/stats",
                     "description": "Get rate limiter statistics",
+                },
+                "extraction": {
+                    "method": "POST",
+                    "path": "/api/v1/extraction",
+                    "params": {
+                        "file": "PDF file (required)",
+                        "schemas": 'JSON array [{"name":"...","schema":"..."}] (required)',
+                        "name": "Submission ID override (optional)",
+                    },
+                    "file_types": "PDF",
+                    "examples": [
+                        {
+                            "description": "Single or multiple schema extraction",
+                            "curl": (
+                                "curl -X POST 'http://localhost:4242/api/v1/extraction' "
+                                "-F 'file=@document.pdf' "
+                                '-F \'schemas=[{"name":"criteria","schema":"{\\"type\\":\\"object\\"}"}]\''
+                            ),
+                        },
+                    ],
                 },
                 "health": {
                     "method": "GET",
